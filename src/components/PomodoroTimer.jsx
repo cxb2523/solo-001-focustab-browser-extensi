@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react'
+import React, { useCallback, useMemo } from 'react'
 import './PomodoroTimer.css'
 import { usePomodoro, formatMs } from '../hooks/usePomodoro'
 
@@ -8,17 +8,27 @@ const ringProps = {
 }
 
 const PomodoroTimer = ({ onWorkComplete }) => {
+  // Only a *natural* work-session completion reaches this handler. The hook
+  // supplies a unique completionId and the configured work length; start,
+  // pause, reset and skip never produce a completion event.
+  const handleWorkComplete = useCallback(
+    ({ completionId, workMinutes }) => {
+      if (typeof onWorkComplete === 'function' && completionId) {
+        onWorkComplete({ completionId, workMinutes })
+      }
+    },
+    [onWorkComplete]
+  )
+
   const {
     state,
-    start,
-    pause,
     reset,
     skip,
     toggleRun,
     toggleAutoStart,
     toggleSound,
     toggleNotifications,
-  } = usePomodoro({ onWorkComplete })
+  } = usePomodoro({ onWorkComplete: handleWorkComplete })
 
   const circumference = useMemo(
     () => 2 * Math.PI * ((ringProps.size - ringProps.stroke) / 2),

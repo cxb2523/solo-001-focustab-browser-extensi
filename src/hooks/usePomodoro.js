@@ -47,25 +47,30 @@ const safeParse = (key, fallback) => {
   try {
     const raw = localStorage.getItem(key)
     return raw ? { ...fallback, ...JSON.parse(raw) } : fallback
-  } catch (e) {
+  } catch {
     return fallback
   }
 }
 
-const resolveInitialState = (settings) => {
-  const saved = safeParse(STATE_KEY, DEFAULT_STATE(settings))
-  // If previously running, adjust remaining based on elapsed time
-  if (saved.isRunning && saved.startedAt) {
-    const elapsed = Date.now() - saved.startedAt
-    const remaining = Math.max(saved.remainingMs - elapsed, 0)
-    return {
-      ...saved,
-      remainingMs: remaining,
-      isRunning: remaining > 0 ? true : false,
-      startedAt: remaining > 0 ? Date.now() : null,
-    }
+// Unique id for one natural work-session completion. Used by the stats layer
+// to guarantee the completion is counted at most once even if React mounts the
+// completion effect twice (StrictMode) or the callback is re-delivered.
+const createCompletionId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `pc_${crypto.randomUUID()}`
   }
-  return saved
+  const random =
+    typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
+      ? Array.from(crypto.getRandomValues(new Uint8Array(8))).join('')
+      : Math.random().toString(36).slice(2)
+  return `pc_${Date.now().toString(36)}_${random}`
+}
+
+const resolveInitialState = (settings) => {
+  // Never auto-resume a session across a page load: a timer running while the
+  // new tab page is closed must not complete and emit a stats event the user
+  // never watched. Each load starts on a fresh, paused work session.
+  return DEFAULT_STATE(settings)
 }
 
 // Simple chime with AudioContext (resumed to avoid autoplay blocking) plus HTMLAudio fallback.
@@ -91,13 +96,13 @@ const playChime = async (enabled) => {
       osc.stop(ctx.currentTime + 0.72)
       return
     }
-  } catch (e) {
+  } catch {
     // fall through to HTMLAudio fallback
   }
   try {
     const audio = new Audio(CHIME_DATA_URL)
     await audio.play()
-  } catch (e) {
+  } catch {
     // ignore audio errors (e.g., autoplay restrictions)
   }
 }
@@ -127,6 +132,13 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
   const [state, setState] = useState(() => resolveInitialState(settings))
   const tickRef = useRef(null)
   const lastTickRef = useRef(null)
+  // Guarantees the natural-completion event for a single run is emitted once.
+  const completionEmittedRef = useRef(false)
+  // Always-current callback so the completion effect never calls a stale one.
+  const onWorkCompleteRef = useRef(onWorkComplete)
+  useEffect(() => {
+    onWorkCompleteRef.current = onWorkComplete
+  }, [onWorkComplete])
 
   const sessionDurationMs = useMemo(() => {
     const seconds =
@@ -172,6 +184,8 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
   const reset = () => {
     setState(DEFAULT_STATE(settings))
     lastTickRef.current = null
+    // Fresh session: its future natural completion is allowed to emit again.
+    completionEmittedRef.current = false
   }
 
   const toggleRun = () => (state.isRunning ? pause() : start())
@@ -194,6 +208,8 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
     if (isRunning) {
       lastTickRef.current = Date.now()
     }
+    // The new session has not completed yet, so arm its emission guard.
+    completionEmittedRef.current = false
   }
 
   const skip = () => {
@@ -201,6 +217,9 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
     applyNextMode(nextMode, nextCycle, settings.autoStart)
   }
 
+  // Play chime / notification and move to the next session after a *natural*
+  // countdown to zero. Stats bookkeeping is emitted separately by the caller
+  // (the zero-remaining effect below), and only for work sessions.
   const completeSession = async () => {
     await playChime(settings.sound)
     maybeVibrate()
@@ -209,9 +228,6 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
       body: 'Switching to the next session',
       enabled: settings.notifications,
     })
-    if (state.mode === 'work' && typeof onWorkComplete === 'function') {
-      onWorkComplete()
-    }
     const { nextMode, nextCycle } = getNextMode(state.mode, state.cycleCount, settings)
     applyNextMode(nextMode, nextCycle, settings.autoStart)
   }
@@ -244,11 +260,22 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
     }
   }, [state.isRunning])
 
-  // Handle completion when remaining hits 0
+  // Handle a natural completion (remaining hits 0). Start / pause / reset and
+  // skip never reach this branch, so they are never counted.
   useEffect(() => {
-    if (state.remainingMs === 0 && !state.isRunning) {
-      completeSession()
+    if (state.remainingMs !== 0 || state.isRunning) return
+
+    if (state.mode === 'work' && !completionEmittedRef.current) {
+      completionEmittedRef.current = true
+      const completionId = createCompletionId()
+      // Credit the configured length of the session that just finished.
+      const workMinutes = Math.max(0, Math.round(settings.work / 60))
+      if (typeof onWorkCompleteRef.current === 'function') {
+        onWorkCompleteRef.current({ completionId, workMinutes })
+      }
     }
+
+    completeSession()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.remainingMs, state.isRunning])
 
@@ -318,3 +345,5 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
     setState,
   }
 }
+
+

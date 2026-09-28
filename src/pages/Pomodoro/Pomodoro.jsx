@@ -2,7 +2,7 @@ import React from 'react'
 import PomodoroTimer from '../../components/PomodoroTimer.jsx'
 import './Pomodoro.css'
 
-const PomodoroPage = ({ onBack }) => {
+const PomodoroPage = ({ onBack, onWorkComplete }) => {
   return (
     <div className="pomodoro-page">
       <div className="pomodoro-page__header">
@@ -12,7 +12,7 @@ const PomodoroPage = ({ onBack }) => {
       </div>
 
       <div className="pomodoro-page__card">
-        <PomodoroTimer onWorkComplete={() => {}} />
+        <PomodoroTimer onWorkComplete={onWorkComplete} />
       </div>
 
       <button className="pomodoro-back-btn" onClick={onBack}>

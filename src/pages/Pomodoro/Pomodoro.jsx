@@ -1,8 +1,15 @@
 import React from 'react'
 import PomodoroTimer from '../../components/PomodoroTimer.jsx'
+import { recordWorkCompletion } from '../../utils/statsStorage.js'
 import './Pomodoro.css'
 
 const PomodoroPage = ({ onBack }) => {
+  const handleWorkComplete = ({ completionId, minutes } = {}) => {
+    // Only a work session that ran to zero is reported here; start, pause and
+    // reset never record anything. completionId de-dupes duplicate callbacks.
+    recordWorkCompletion({ completionId, minutes }).catch(() => {})
+  }
+
   return (
     <div className="pomodoro-page">
       <div className="pomodoro-page__header">
@@ -12,7 +19,7 @@ const PomodoroPage = ({ onBack }) => {
       </div>
 
       <div className="pomodoro-page__card">
-        <PomodoroTimer onWorkComplete={() => {}} />
+        <PomodoroTimer onWorkComplete={handleWorkComplete} />
       </div>
 
       <button className="pomodoro-back-btn" onClick={onBack}>

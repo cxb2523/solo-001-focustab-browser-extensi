@@ -1,0 +1,5 @@
+globalThis.IS_REACT_ACT_ENVIRONMENT = true
+globalThis.window = globalThis
+const noop = () => {}
+globalThis.addEventListener = noop
+globalThis.removeEventListener = noop

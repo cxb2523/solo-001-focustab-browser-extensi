@@ -10,8 +10,6 @@ const ringProps = {
 const PomodoroTimer = ({ onWorkComplete }) => {
   const {
     state,
-    start,
-    pause,
     reset,
     skip,
     toggleRun,

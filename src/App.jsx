@@ -5,6 +5,7 @@ import Home from './pages/Home/Home.jsx'
 import {useBrowser} from './contest/browser-context.jsx'
 import Task from './pages/Task/Task.jsx'
 import PomodoroPage from './pages/Pomodoro/Pomodoro.jsx'
+import TodayStats from './components/TodayStats.jsx'
 import { useEffect } from 'react'
 
 
@@ -29,6 +30,7 @@ const App = () => {
 
   return (
     <div className="app" style={{ backgroundImage: `url(${backgroundImage})` }}>
+        {name && view === 'task' && <TodayStats />}
         {renderView()}
     </div>
   )

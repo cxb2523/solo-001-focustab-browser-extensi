@@ -19,6 +19,7 @@ const DEFAULT_STATE = (settings = DEFAULT_SETTINGS) => ({
   isRunning: false,
   cycleCount: 0, // completed work sessions
   startedAt: null,
+  pendingCompletion: null,
 })
 
 const MODE_META = {
@@ -47,9 +48,16 @@ const safeParse = (key, fallback) => {
   try {
     const raw = localStorage.getItem(key)
     return raw ? { ...fallback, ...JSON.parse(raw) } : fallback
-  } catch (e) {
+  } catch {
     return fallback
   }
+}
+
+const createCompletionId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `completion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 const resolveInitialState = (settings) => {
@@ -58,11 +66,17 @@ const resolveInitialState = (settings) => {
   if (saved.isRunning && saved.startedAt) {
     const elapsed = Date.now() - saved.startedAt
     const remaining = Math.max(saved.remainingMs - elapsed, 0)
+    if (remaining <= 0) {
+      // Expired while the page was closed: start a fresh session without
+      // emitting a completion (it was never observed running to zero here).
+      return DEFAULT_STATE(settings)
+    }
     return {
       ...saved,
       remainingMs: remaining,
-      isRunning: remaining > 0 ? true : false,
-      startedAt: remaining > 0 ? Date.now() : null,
+      isRunning: true,
+      startedAt: Date.now(),
+      remainingMsAtStart: remaining,
     }
   }
   return saved
@@ -91,13 +105,13 @@ const playChime = async (enabled) => {
       osc.stop(ctx.currentTime + 0.72)
       return
     }
-  } catch (e) {
+  } catch {
     // fall through to HTMLAudio fallback
   }
   try {
     const audio = new Audio(CHIME_DATA_URL)
     await audio.play()
-  } catch (e) {
+  } catch {
     // ignore audio errors (e.g., autoplay restrictions)
   }
 }
@@ -126,7 +140,12 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
   const [settings, setSettings] = useState(() => safeParse(SETTINGS_KEY, DEFAULT_SETTINGS))
   const [state, setState] = useState(() => resolveInitialState(settings))
   const tickRef = useRef(null)
-  const lastTickRef = useRef(null)
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  const onWorkCompleteRef = useRef(onWorkComplete)
+  onWorkCompleteRef.current = onWorkComplete
+  const completionSideEffectsRef = useRef(new Set())
+  const completionAdvancedRef = useRef(new Set())
 
   const sessionDurationMs = useMemo(() => {
     const seconds =
@@ -151,27 +170,37 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
     )
   }, [state, sessionDurationMs])
 
-  const updateState = (partial) =>
-    setState((prev) => ({ ...prev, ...partial }))
 
   const start = () => {
-    updateState({ isRunning: true, startedAt: Date.now() })
-    lastTickRef.current = Date.now()
+    const now = Date.now()
+    setState((prev) => ({
+      ...prev,
+      isRunning: true,
+      startedAt: now,
+      remainingMsAtStart: prev.remainingMs,
+    }))
   }
 
   const pause = () => {
     setState((prev) => {
       if (!prev.isRunning) return prev
       const now = Date.now()
+      const baseRemaining =
+        prev.remainingMsAtStart ?? prev.remainingMs
       const elapsed = prev.startedAt ? now - prev.startedAt : 0
-      const remainingMs = Math.max(prev.remainingMs - elapsed, 0)
-      return { ...prev, isRunning: false, remainingMs, startedAt: null }
+      const remainingMs = Math.max(baseRemaining - elapsed, 0)
+      return {
+        ...prev,
+        isRunning: false,
+        remainingMs,
+        startedAt: null,
+        remainingMsAtStart: undefined,
+      }
     })
   }
 
   const reset = () => {
     setState(DEFAULT_STATE(settings))
-    lastTickRef.current = null
   }
 
   const toggleRun = () => (state.isRunning ? pause() : start())
@@ -190,28 +219,12 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
       remainingMs: nextDuration * 1000,
       isRunning,
       startedAt: isRunning ? Date.now() : null,
+      remainingMsAtStart: isRunning ? nextDuration * 1000 : undefined,
+      pendingCompletion: null,
     })
-    if (isRunning) {
-      lastTickRef.current = Date.now()
-    }
   }
 
   const skip = () => {
-    const { nextMode, nextCycle } = getNextMode(state.mode, state.cycleCount, settings)
-    applyNextMode(nextMode, nextCycle, settings.autoStart)
-  }
-
-  const completeSession = async () => {
-    await playChime(settings.sound)
-    maybeVibrate()
-    await notify({
-      title: `${MODE_META[state.mode].label} complete`,
-      body: 'Switching to the next session',
-      enabled: settings.notifications,
-    })
-    if (state.mode === 'work' && typeof onWorkComplete === 'function') {
-      onWorkComplete()
-    }
     const { nextMode, nextCycle } = getNextMode(state.mode, state.cycleCount, settings)
     applyNextMode(nextMode, nextCycle, settings.autoStart)
   }
@@ -226,31 +239,94 @@ export const usePomodoro = ({ onWorkComplete } = {}) => {
       return
     }
     tickRef.current = setInterval(() => {
+      // Functional update keeps the decrement correct even when several
+      // interval callbacks fire before React flushes a render (background-tab
+      // throttling or act() batching), and derive remaining from wall-clock
+      // time vs startedAt so no stale render value is read.
       setState((prev) => {
-        if (!prev.isRunning) return prev
+        if (!prev.isRunning || prev.pendingCompletion) return prev
         const now = Date.now()
-        const elapsed = lastTickRef.current ? now - lastTickRef.current : 0
-        lastTickRef.current = now
-        const remainingMs = Math.max(prev.remainingMs - elapsed, 0)
-        if (remainingMs <= 0) {
-          return { ...prev, remainingMs: 0, isRunning: false, startedAt: null }
+        const baseRemaining =
+          prev.startedAt != null
+            ? prev.remainingMsAtStart ?? prev.remainingMs
+            : prev.remainingMs
+        const elapsed = prev.startedAt != null ? now - prev.startedAt : 0
+        const remainingMs = Math.max(baseRemaining - elapsed, 0)
+        if (remainingMs > 0) {
+          return { ...prev, remainingMs }
         }
-        return { ...prev, remainingMs }
+        // Natural completion only. A unique completionId is minted exactly
+        // once here; pause / reset / skip never create a pendingCompletion.
+        const durationSeconds =
+          prev.mode === 'work'
+            ? settingsRef.current.work
+            : prev.mode === 'shortBreak'
+            ? settingsRef.current.shortBreak
+            : settingsRef.current.longBreak
+        return {
+          ...prev,
+          remainingMs: 0,
+          isRunning: false,
+          startedAt: null,
+          remainingMsAtStart: undefined,
+          pendingCompletion: {
+            token: createCompletionId(),
+            mode: prev.mode,
+            durationSeconds,
+          },
+        }
       })
     }, 1000)
-    lastTickRef.current = Date.now()
     return () => {
       if (tickRef.current) clearInterval(tickRef.current)
     }
   }, [state.isRunning])
 
-  // Handle completion when remaining hits 0
+  // Handle a work/break session that ran to zero naturally. Ref guards make
+  // StrictMode's double effect invocation safe: the completion event (with its
+  // unique completionId) and the mode advance each happen a single time.
   useEffect(() => {
-    if (state.remainingMs === 0 && !state.isRunning) {
-      completeSession()
+    const pending = state.pendingCompletion
+    if (!pending) return
+
+    if (!completionSideEffectsRef.current.has(pending.token)) {
+      completionSideEffectsRef.current.add(pending.token)
+      if (completionSideEffectsRef.current.size > 50) {
+        completionSideEffectsRef.current.delete(
+          completionSideEffectsRef.current.values().next().value
+        )
+      }
+      playChime(settingsRef.current.sound)
+      maybeVibrate()
+      notify({
+        title: `${MODE_META[pending.mode].label} complete`,
+        body: 'Switching to the next session',
+        enabled: settingsRef.current.notifications,
+      })
+      if (
+        pending.mode === 'work' &&
+        typeof onWorkCompleteRef.current === 'function'
+      ) {
+        onWorkCompleteRef.current({
+          completionId: pending.token,
+          minutes: pending.durationSeconds / 60,
+          mode: 'work',
+          completedAt: Date.now(),
+        })
+      }
+    }
+
+    if (!completionAdvancedRef.current.has(pending.token)) {
+      completionAdvancedRef.current.add(pending.token)
+      const { nextMode, nextCycle } = getNextMode(
+        state.mode,
+        state.cycleCount,
+        settingsRef.current
+      )
+      applyNextMode(nextMode, nextCycle, settingsRef.current.autoStart)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.remainingMs, state.isRunning])
+  }, [state.pendingCompletion])
 
   // Keyboard shortcuts
   useEffect(() => {
